@@ -111,3 +111,7 @@ pm2 start start.sh --name polyrift-bot
 ## License
 
 MIT
+
+## Attribution
+
+If you fork or deploy this bot, please credit PolyRift and link back to this repo. Built by [@polyrift](https://twitter.com/polyrift).
