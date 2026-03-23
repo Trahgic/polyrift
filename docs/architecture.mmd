@@ -1,0 +1,68 @@
+flowchart TB
+    subgraph Telegram["Telegram"]
+        User["👤 User"]
+        BotFather["@PolyRiftBot"]
+    end
+
+    subgraph Bot["Bot Layer (aiogram 3.x)"]
+        Dispatcher["Dispatcher"]
+        Handlers["Command & Callback Handlers"]
+        Keyboards["Inline Keyboards"]
+    end
+
+    subgraph Trading["Trading Engine"]
+        MarketOrders["Market Orders"]
+        LimitOrders["Limit Orders"]
+        AutoSell["Auto-Sell"]
+        CopyTrading["Copy Trading"]
+    end
+
+    subgraph Background["Background Jobs (APScheduler)"]
+        AutoSellChecker["Auto-Sell Checker\n(every 2 min)"]
+        PriceAlerts["Price Alerts\n(every 10 min)"]
+        CopyPoller["Copy Trade Poller\n(every 1 min)"]
+    end
+
+    subgraph Wallet["Wallet Layer"]
+        WalletGen["Wallet Generation\n(eth_account)"]
+        Encryption["Fernet Encryption"]
+        GasRelay["Gas Relay"]
+    end
+
+    subgraph External["External Services"]
+        Polymarket["Polymarket CLOB API"]
+        Polygon["Polygon Network\n(web3.py)"]
+        Supabase["Supabase\n(PostgreSQL)"]
+        MoonPay["MoonPay\n(Deposits)"]
+        GammaAPI["Gamma API\n(Market Data)"]
+    end
+
+    User <-->|commands & callbacks| BotFather
+    BotFather <--> Dispatcher
+    Dispatcher --> Handlers
+    Handlers --> Keyboards
+
+    Handlers --> MarketOrders
+    Handlers --> LimitOrders
+    Handlers --> AutoSell
+    Handlers --> CopyTrading
+
+    MarketOrders --> Polymarket
+    LimitOrders --> Polymarket
+    CopyTrading --> Polymarket
+
+    AutoSellChecker --> Polymarket
+    PriceAlerts --> GammaAPI
+    CopyPoller --> Polymarket
+
+    WalletGen --> Encryption
+    Encryption --> Supabase
+
+    MarketOrders --> Polygon
+    LimitOrders --> Polygon
+    GasRelay --> Polygon
+
+    Handlers --> Supabase
+    Handlers --> GammaAPI
+    Handlers --> MoonPay
+    Handlers --> WalletGen

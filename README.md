@@ -1,5 +1,61 @@
 # PolyRift
 
+## Architecture
+```mermaid
+flowchart TB
+    subgraph Telegram["Telegram"]
+        User["👤 User"]
+        BotFather["@PolyRiftBot"]
+    end
+
+    subgraph Bot["Bot Layer (aiogram 3.x)"]
+        Dispatcher["Dispatcher"]
+        Handlers["Command & Callback Handlers"]
+    end
+
+    subgraph Trading["Trading Engine"]
+        MarketOrders["Market Orders"]
+        LimitOrders["Limit Orders"]
+        AutoSell["Auto-Sell"]
+        CopyTrading["Copy Trading"]
+    end
+
+    subgraph Background["Background Jobs (APScheduler)"]
+        AutoSellChecker["Auto-Sell Checker (every 2 min)"]
+        PriceAlerts["Price Alerts (every 10 min)"]
+        CopyPoller["Copy Trade Poller (every 1 min)"]
+    end
+
+    subgraph Wallet["Wallet Layer"]
+        WalletGen["Wallet Generation"]
+        Encryption["Fernet Encryption"]
+    end
+
+    subgraph External["External Services"]
+        Polymarket["Polymarket CLOB API"]
+        Polygon["Polygon Network"]
+        Supabase["Supabase (PostgreSQL)"]
+        MoonPay["MoonPay"]
+        GammaAPI["Gamma API"]
+    end
+
+    User <--> BotFather
+    BotFather <--> Dispatcher
+    Dispatcher --> Handlers
+    Handlers --> Trading
+    Trading --> Polymarket
+    Trading --> Polygon
+    Background --> Polymarket
+    Background --> GammaAPI
+    WalletGen --> Encryption
+    Encryption --> Supabase
+    Handlers --> Supabase
+    Handlers --> MoonPay
+    Handlers --> WalletGen
+```
+
+> Full diagram in [`docs/architecture.mmd`](docs/architecture.mmd)
+
 A Telegram bot for trading on [Polymarket](https://polymarket.com) prediction markets. Place orders, copy top traders, track your portfolio, and manage crypto wallets — all from a Telegram chat.
 
 ## Features
@@ -54,7 +110,6 @@ A Telegram bot for trading on [Polymarket](https://polymarket.com) prediction ma
 - Polymarket CLOB API credentials
 
 ### Installation
-
 ```bash
 git clone https://github.com/Trahgic/polyrift.git
 cd polyrift
@@ -66,7 +121,6 @@ pip install -r requirements.txt
 ### Configuration
 
 Copy the example env file and fill in your credentials:
-
 ```bash
 cp .env.example .env
 nano .env
@@ -75,7 +129,6 @@ nano .env
 See `.env.example` for all required variables.
 
 ### Running
-
 ```bash
 # development
 python bot.py
@@ -108,10 +161,10 @@ pm2 start start.sh --name polyrift-bot
 - Twitter: [@polyrift](https://twitter.com/polyrift)
 - Domain: [polyrift.xyz](https://polyrift.xyz)
 
-## License
-
-MIT
-
 ## Attribution
 
 If you fork or deploy this bot, please credit PolyRift and link back to this repo. Built by [@polyrift](https://twitter.com/polyrift).
+
+## License
+
+MIT
