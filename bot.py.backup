@@ -1,0 +1,1696 @@
+import os
+import json
+import requests
+import asyncio
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, BotCommand
+)
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from eth_account import Account
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from supabase import create_client
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.constants import POLYGON
+from web3 import Web3
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timezone, timedelta
+import uuid
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+FERNET_KEY = os.getenv("MASTER_FERNET_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ALCHEMY_RPC = os.getenv("ALCHEMY_RPC")
+RELAY_PRIVATE_KEY = os.getenv("RELAY_PRIVATE_KEY")
+
+FEE_PERCENT = 0.01
+FEE_WALLET = Web3.to_checksum_address('0x1D78A40D4915856741a17Dd12AEd2B7BBaee5Cbc')
+
+# Gas relay config
+RELAY_THRESHOLD_POL = 0.05   # top up if user has less than this much POL
+RELAY_AMOUNT_POL    = 0.15   # how much POL to send (~150 transactions worth)
+RELAY_COOLDOWN_HRS  = 24     # only relay once per 24h per user
+
+fernet = Fernet(FERNET_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+scheduler = AsyncIOScheduler()
+
+token_store = {}
+position_store = {}
+last_prices = {}
+
+USDC_E = Web3.to_checksum_address('0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174')
+CTF = Web3.to_checksum_address('0x4D97DCd97eC945f40cF65F87097ACe5EA0476045')
+EXCHANGE = Web3.to_checksum_address('0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E')
+SPENDERS = [
+    '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+    '0xC5d563A36AE78145C45a50134d48A1215220f80a',
+    '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
+]
+APPROVE_ABI = [
+    {'inputs':[{'name':'spender','type':'address'},{'name':'amount','type':'uint256'}],'name':'approve','outputs':[{'name':'','type':'bool'}],'type':'function'},
+    {'inputs':[{'name':'owner','type':'address'},{'name':'spender','type':'address'}],'name':'allowance','outputs':[{'name':'','type':'uint256'}],'type':'function'}
+]
+CTF_ABI = [
+    {'inputs':[{'name':'operator','type':'address'},{'name':'approved','type':'bool'}],'name':'setApprovalForAll','outputs':[],'type':'function'},
+    {'inputs':[{'name':'account','type':'address'},{'name':'operator','type':'address'}],'name':'isApprovedForAll','outputs':[{'name':'','type':'bool'}],'type':'function'}
+]
+ERC20_ABI = [
+    {'inputs':[{'name':'spender','type':'address'},{'name':'amount','type':'uint256'}],'name':'approve','outputs':[{'name':'','type':'bool'}],'type':'function'},
+    {'inputs':[{'name':'owner','type':'address'},{'name':'spender','type':'address'}],'name':'allowance','outputs':[{'name':'','type':'uint256'}],'type':'function'},
+    {'inputs':[{'name':'account','type':'address'}],'name':'balanceOf','outputs':[{'name':'','type':'uint256'}],'type':'function'},
+    {'inputs':[{'name':'to','type':'address'},{'name':'amount','type':'uint256'}],'name':'transfer','outputs':[{'name':'','type':'bool'}],'type':'function'}
+]
+
+class TradeStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_confirm = State()
+    waiting_for_sell_amount = State()
+    waiting_for_search = State()
+    waiting_for_copy_wallet = State()
+    waiting_for_copy_percent = State()
+    waiting_for_copy_max = State()
+    waiting_for_copy_fixed = State()
+    waiting_for_autosell_price = State()
+    waiting_for_display_name = State()
+    waiting_for_withdraw_address = State()
+    waiting_for_withdraw_amount = State()
+    waiting_for_withdraw_confirm = State()
+
+# ─── UI helpers ──────────────────────────────────────────────
+
+def sentiment_bar(yes_price_float):
+    filled = round(yes_price_float * 10)
+    filled = max(0, min(10, filled))
+    return "🟩" * filled + "⬜" * (10 - filled)
+
+def format_market_card(m, tokens):
+    question = m.get("question", "Unknown")
+    yes_price_f = 0.5
+    no_price_f = 0.5
+    yes_str = "N/A"
+    no_str = "N/A"
+    for t in tokens:
+        try:
+            p = float(t.get('price', 0))
+            if t.get("outcome") == "Yes":
+                yes_price_f = p
+                yes_str = f"{round(p * 100)}¢"
+            if t.get("outcome") == "No":
+                no_price_f = p
+                no_str = f"{round(p * 100)}¢"
+        except: pass
+    if yes_str == "N/A":
+        try:
+            prices = m.get("outcomePrices", "[]")
+            if isinstance(prices, str): prices = json.loads(prices)
+            yes_price_f = float(prices[0])
+            no_price_f = float(prices[1])
+            yes_str = f"{round(yes_price_f * 100)}¢"
+            no_str = f"{round(no_price_f * 100)}¢"
+        except: pass
+    bar = sentiment_bar(yes_price_f)
+    volume = m.get("volume24hr", 0)
+    vol_str = f"${float(volume):,.0f}" if volume else "N/A"
+    end_date = m.get("endDate", "")
+    end_str = ""
+    if end_date:
+        try:
+            end = datetime.strptime(end_date[:10], "%Y-%m-%d")
+            days_left = (end - datetime.now()).days
+            if days_left <= 1:
+                end_str = "\n⚠️ _Expires tomorrow!_"
+            elif days_left <= 3:
+                end_str = f"\n⚠️ _Expires in {days_left} days_"
+            elif days_left <= 7:
+                end_str = f"\n⏳ _Expires in {days_left} days_"
+        except: pass
+    return (
+        f"*{question}*\n\n"
+        f"{bar}\n"
+        f"🟢 Yes: *{yes_str}*  🔴 No: *{no_str}*\n"
+        f"📊 24h Vol: {vol_str}{end_str}"
+    ), yes_price_f, no_price_f
+
+def dynamic_amount_buttons(bal, outcome, token_key):
+    ten = round(bal * 0.10, 2)
+    twenty = round(bal * 0.25, 2)
+    fifty = round(bal * 0.50, 2)
+    row = []
+    for pct, amt in [("10%", ten), ("25%", twenty), ("50%", fifty)]:
+        if amt >= 1:
+            row.append(InlineKeyboardButton(
+                text=f"{pct} (${amt:.2f})",
+                callback_data=f"amt:{amt}:{outcome}:{token_key}"
+            ))
+    buttons = []
+    if row: buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def moonpay_url(wallet_address):
+    return (
+        f"https://buy.moonpay.com/"
+        f"?currencyCode=usdc_polygon"
+        f"&walletAddress={wallet_address}"
+    )
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📈 Markets", callback_data="menu:markets"),
+            InlineKeyboardButton(text="🔍 Search", callback_data="menu:search"),
+        ],
+        [
+            InlineKeyboardButton(text="💼 Portfolio", callback_data="menu:portfolio"),
+            InlineKeyboardButton(text="💰 Balance", callback_data="menu:balance"),
+        ],
+        [
+            InlineKeyboardButton(text="🤖 Copy Trade", callback_data="menu:copy"),
+            InlineKeyboardButton(text="🏆 Leaderboard", callback_data="menu:leaderboard"),
+        ],
+        [
+            InlineKeyboardButton(text="📤 Withdraw", callback_data="menu:withdraw"),
+            InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings"),
+        ]
+    ])
+
+def back_to_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")]
+    ])
+
+def back_to_copy():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Back to Copy Trade", callback_data="menu:copy")]
+    ])
+
+# ─── Web3 helpers ────────────────────────────────────────────
+
+def get_w3():
+    return Web3(Web3.HTTPProvider(ALCHEMY_RPC))
+
+def get_pol_balance(wallet_address):
+    try:
+        w3 = get_w3()
+        return w3.eth.get_balance(Web3.to_checksum_address(wallet_address)) / 1e18
+    except:
+        return 0
+
+def relay_gas(to_address):
+    """Send POL from relay wallet to user wallet. Returns tx hash or None."""
+    if not RELAY_PRIVATE_KEY:
+        return None
+    try:
+        w3 = get_w3()
+        relay_account = w3.eth.account.from_key(RELAY_PRIVATE_KEY)
+        amount_wei = w3.to_wei(RELAY_AMOUNT_POL, 'ether')
+        nonce = w3.eth.get_transaction_count(relay_account.address)
+        gas_price = w3.eth.gas_price
+        tx = {
+            'to': Web3.to_checksum_address(to_address),
+            'value': amount_wei,
+            'gas': 21000,
+            'gasPrice': gas_price,
+            'nonce': nonce,
+            'chainId': 137
+        }
+        signed = w3.eth.account.sign_transaction(tx, RELAY_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        return tx_hash.hex()
+    except Exception as e:
+        print(f"Gas relay error: {e}")
+        return None
+
+def needs_gas_relay(user):
+    """Check if user needs a gas top-up and is not on cooldown."""
+    wallet = user.get("wallet_address")
+    if not wallet:
+        return False
+    pol_bal = get_pol_balance(wallet)
+    if pol_bal >= RELAY_THRESHOLD_POL:
+        return False
+    last_relay = user.get("last_relay_at")
+    if last_relay:
+        try:
+            last_dt = datetime.fromisoformat(last_relay.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - last_dt < timedelta(hours=RELAY_COOLDOWN_HRS):
+                return False
+        except:
+            pass
+    return True
+
+async def maybe_relay_gas(user):
+    """Top up user gas if needed. Notifies them via Telegram."""
+    if not needs_gas_relay(user):
+        return
+    tx_hash = relay_gas(user["wallet_address"])
+    if tx_hash:
+        supabase.table("users").update({
+            "last_relay_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", user["id"]).execute()
+        try:
+            await bot.send_message(
+                user["id"],
+                f"⛽ *Gas Top-Up Sent!*\n\n"
+                f"We noticed your wallet was low on POL for gas fees.\n"
+                f"Sent *{RELAY_AMOUNT_POL} POL* to your wallet — you're all set!\n\n"
+                f"🔗 [View on PolygonScan](https://polygonscan.com/tx/{tx_hash})",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+
+def collect_fee(private_key, amount_usdc):
+    try:
+        fee = round(amount_usdc * FEE_PERCENT, 6)
+        fee_raw = int(fee * 1_000_000)
+        if fee_raw <= 0: return 0
+        w3 = get_w3()
+        account = w3.eth.account.from_key(private_key)
+        contract = w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
+        nonce = w3.eth.get_transaction_count(account.address)
+        tx = contract.functions.transfer(FEE_WALLET, fee_raw).build_transaction({
+            'from': account.address, 'nonce': nonce,
+            'gas': 100000, 'gasPrice': w3.eth.gas_price
+        })
+        w3.eth.send_raw_transaction(w3.eth.account.sign_transaction(tx, private_key).raw_transaction)
+        return fee
+    except Exception as e:
+        print(f"Fee error: {e}")
+        return 0
+
+def send_usdc(private_key, to_address, amount_usdc):
+    w3 = get_w3()
+    account = w3.eth.account.from_key(private_key)
+    contract = w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
+    amount_raw = int(amount_usdc * 1_000_000)
+    nonce = w3.eth.get_transaction_count(account.address)
+    tx = contract.functions.transfer(
+        Web3.to_checksum_address(to_address), amount_raw
+    ).build_transaction({
+        'from': account.address, 'nonce': nonce,
+        'gas': 100000, 'gasPrice': w3.eth.gas_price
+    })
+    signed = w3.eth.account.sign_transaction(tx, private_key)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    return tx_hash.hex()
+
+def setup_wallet_approvals(private_key):
+    w3 = get_w3()
+    account = w3.eth.account.from_key(private_key)
+    usdc = w3.eth.contract(address=USDC_E, abi=APPROVE_ABI)
+    ctf = w3.eth.contract(address=CTF, abi=CTF_ABI)
+    nonce = w3.eth.get_transaction_count(account.address)
+    count = 0
+    for spender in SPENDERS:
+        if usdc.functions.allowance(account.address, Web3.to_checksum_address(spender)).call() > 0:
+            continue
+        tx = usdc.functions.approve(Web3.to_checksum_address(spender), 2**256-1).build_transaction({
+            'from': account.address, 'nonce': nonce, 'gas': 100000, 'gasPrice': w3.eth.gas_price
+        })
+        w3.eth.send_raw_transaction(w3.eth.account.sign_transaction(tx, private_key).raw_transaction)
+        nonce += 1
+        count += 1
+    if not ctf.functions.isApprovedForAll(account.address, EXCHANGE).call():
+        tx = ctf.functions.setApprovalForAll(EXCHANGE, True).build_transaction({
+            'from': account.address, 'nonce': nonce, 'gas': 100000, 'gasPrice': w3.eth.gas_price
+        })
+        w3.eth.send_raw_transaction(w3.eth.account.sign_transaction(tx, private_key).raw_transaction)
+        count += 1
+    return count
+
+def get_usdc_balance(wallet_address):
+    try:
+        w3 = get_w3()
+        contract = w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
+        return contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call() / 1_000_000
+    except:
+        return 0
+
+# ─── Market helpers ──────────────────────────────────────────
+
+def get_clob_tokens(condition_id):
+    try:
+        r = requests.get(f"https://clob.polymarket.com/markets/{condition_id}", timeout=5)
+        return r.json().get("tokens", []) if r.ok else []
+    except:
+        return []
+
+def get_markets(search=None, limit=5):
+    try:
+        if search:
+            url = f"https://gamma-api.polymarket.com/markets?search={search}&limit={limit}&active=true"
+        else:
+            url = f"https://gamma-api.polymarket.com/markets?limit={limit}&active=true&order=volume24hr&ascending=false"
+        r = requests.get(url, timeout=5)
+        return r.json() if r.ok else []
+    except:
+        return []
+
+def get_market_of_day():
+    try:
+        r = requests.get("https://gamma-api.polymarket.com/markets?limit=1&active=true&order=volume&ascending=false", timeout=5)
+        data = r.json()
+        return data[0] if data else None
+    except:
+        return None
+
+def get_positions(wallet_address):
+    try:
+        r = requests.get(f"https://data-api.polymarket.com/positions?user={wallet_address}&sizeThreshold=0.01", timeout=5)
+        return r.json() if r.ok else []
+    except:
+        return []
+
+def get_recent_trades(wallet_address, limit=10):
+    try:
+        r = requests.get(f"https://data-api.polymarket.com/activity?user={wallet_address}&limit={limit}", timeout=5)
+        return r.json() if r.ok else []
+    except:
+        return []
+
+def get_trade_keyboard(tokens):
+    yes_token = no_token = None
+    for t in tokens:
+        if t.get("outcome") == "Yes": yes_token = t.get("token_id")
+        if t.get("outcome") == "No": no_token = t.get("token_id")
+    if not yes_token or not no_token: return None
+    yk = str(uuid.uuid4())[:8]
+    nk = str(uuid.uuid4())[:8]
+    token_store[yk] = yes_token
+    token_store[nk] = no_token
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🟢 Buy YES", callback_data=f"t:y:{yk}"),
+        InlineKeyboardButton(text="🔴 Buy NO", callback_data=f"t:n:{nk}")
+    ]])
+
+# ─── DB helpers ──────────────────────────────────────────────
+
+def get_user(user_id):
+    r = supabase.table("users").select("*").eq("id", user_id).execute()
+    return r.data[0] if r.data else None
+
+def decrypt_key(enc): return fernet.decrypt(enc.encode()).decode()
+
+def is_trade_seen(user_id, trade_id):
+    r = supabase.table("seen_trades").select("id").eq("user_id", user_id).eq("trade_id", trade_id).execute()
+    return len(r.data) > 0
+
+def mark_trade_seen(user_id, trade_id):
+    try: supabase.table("seen_trades").insert({"user_id": user_id, "trade_id": trade_id}).execute()
+    except: pass
+
+def get_daily_pnl(wallet_address):
+    try:
+        pos = get_positions(wallet_address)
+        return sum(float(p.get("cashPnl", 0)) for p in pos)
+    except:
+        return 0
+
+# ─── /start ──────────────────────────────────────────────────
+
+@router.message(Command("start"))
+async def start(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name or "trader"
+    existing = supabase.table("users").select("*").eq("id", user_id).execute()
+
+    if existing.data:
+        user = existing.data[0]
+        bal = get_usdc_balance(user["wallet_address"])
+        pnl = get_daily_pnl(user["wallet_address"])
+        streak = user.get("win_streak", 0) or 0
+        pnl_str = f"📈 +${pnl:.2f}" if pnl >= 0 else f"📉 -${abs(pnl):.2f}"
+        streak_str = f"\n🔥 Win streak: *{streak}*" if streak >= 2 else ""
+        asyncio.create_task(maybe_relay_gas(user))
+        await message.answer(
+            f"👋 *Welcome back, {first_name}!*\n\n"
+            f"💰 Balance: *${bal:.2f} USDC.e*\n"
+            f"{pnl_str} PnL{streak_str}\n\n"
+            f"What would you like to do?",
+            parse_mode="Markdown", reply_markup=main_menu()
+        )
+        return
+
+    account = Account.create()
+    encrypted_key = fernet.encrypt(account.key.hex().encode()).decode()
+    supabase.table("users").insert({
+        "id": user_id, "username": username,
+        "wallet_address": account.address, "encrypted_key": encrypted_key
+    }).execute()
+    await message.answer(
+        f"🌊 *Welcome to PolyRift, {first_name}!*\n\n"
+        f"Your personal trading wallet has been created.\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 *Your Wallet Address*\n"
+        f"`{account.address}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*To get started:*\n"
+        f"1️⃣ Send *USDC.e* on Polygon to your wallet\n"
+        f"2️⃣ Tap ⚙️ *Settings → Activate Wallet* below\n\n"
+        f"_Gas fees are covered by PolyRift ⛽_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Activate Wallet", callback_data="menu:settings")],
+            [InlineKeyboardButton(text="📈 Browse Markets", callback_data="menu:markets")]
+        ])
+    )
+
+# ─── Main menu ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:main")
+async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user = get_user(callback.from_user.id)
+    first_name = callback.from_user.first_name or "trader"
+    if user:
+        bal = get_usdc_balance(user["wallet_address"])
+        pnl = get_daily_pnl(user["wallet_address"])
+        streak = user.get("win_streak", 0) or 0
+        pnl_str = f"📈 +${pnl:.2f}" if pnl >= 0 else f"📉 -${abs(pnl):.2f}"
+        streak_str = f"\n🔥 Win streak: *{streak}*" if streak >= 2 else ""
+        text = (
+            f"👋 *Welcome back, {first_name}!*\n\n"
+            f"💰 Balance: *${bal:.2f} USDC.e*\n"
+            f"{pnl_str} PnL{streak_str}\n\n"
+            f"What would you like to do?"
+        )
+    else:
+        text = "👋 What would you like to do?"
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
+    await callback.answer()
+
+# ─── Balance ─────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:balance")
+async def cb_balance(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    bal = get_usdc_balance(user["wallet_address"])
+    pol_bal = get_pol_balance(user["wallet_address"])
+    pnl = get_daily_pnl(user["wallet_address"])
+    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+    pnl_emoji = "📈" if pnl >= 0 else "📉"
+    gas_str = f"⛽ POL (gas): *{pol_bal:.4f}*\n" if pol_bal < RELAY_THRESHOLD_POL else f"⛽ POL (gas): *{pol_bal:.4f}* ✅\n"
+    await callback.message.edit_text(
+        f"💰 *Your Balance*\n\n"
+        f"USDC.e: *${bal:.2f}*\n"
+        f"{gas_str}"
+        f"{pnl_emoji} Total PnL: *{pnl_str}*\n\n"
+        f"📍 Wallet:\n`{user['wallet_address']}`\n\n"
+        f"_Deposit USDC.e on Polygon or buy with card below._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Buy with Card (MoonPay)", url=moonpay_url(user["wallet_address"]))],
+            [InlineKeyboardButton(text="📤 Withdraw", callback_data="menu:withdraw")],
+            [InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")]
+        ])
+    )
+    await callback.answer()
+
+# ─── Withdraw ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:withdraw")
+async def cb_withdraw(callback: CallbackQuery, state: FSMContext):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    bal = get_usdc_balance(user["wallet_address"])
+    if bal < 0.01:
+        await callback.message.edit_text(
+            "📤 *Withdraw*\n\n❌ No balance to withdraw.",
+            parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+        await callback.answer()
+        return
+    await state.update_data(bal=bal)
+    await state.set_state(TradeStates.waiting_for_withdraw_address)
+    await callback.message.edit_text(
+        f"📤 *Withdraw USDC.e*\n\n"
+        f"Available: *${bal:.2f} USDC.e*\n\n"
+        f"Enter the destination wallet address on *Polygon*:\n\n"
+        f"⚠️ _Only send to Polygon addresses. Sending to wrong network = lost funds._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_withdraw_address)
+async def handle_withdraw_address(message: Message, state: FSMContext):
+    address = message.text.strip()
+    if not address.startswith("0x") or len(address) != 42:
+        await message.answer("❌ Invalid address. Must be a valid 0x Polygon address.")
+        return
+    data = await state.get_data()
+    bal = data["bal"]
+    await state.update_data(to_address=address)
+    await state.set_state(TradeStates.waiting_for_withdraw_amount)
+    await message.answer(
+        f"📤 *Withdraw Amount*\n\n"
+        f"Destination: `{address[:8]}...{address[-6:]}`\n"
+        f"Available: *${bal:.2f} USDC.e*\n\n"
+        f"How much would you like to withdraw?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="50%", callback_data=f"wamt:{round(bal * 0.5, 2)}"),
+                InlineKeyboardButton(text="Max", callback_data=f"wamt:{round(bal, 2)}"),
+            ],
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")]
+        ])
+    )
+
+@router.callback_query(F.data.startswith("wamt:"))
+async def handle_withdraw_quick_amount(callback: CallbackQuery, state: FSMContext):
+    amount = float(callback.data.split(":")[1])
+    data = await state.get_data()
+    await state.update_data(amount=amount)
+    await state.set_state(TradeStates.waiting_for_withdraw_confirm)
+    to_address = data["to_address"]
+    await callback.message.edit_text(
+        f"📤 *Confirm Withdrawal*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Amount: *${amount:.2f} USDC.e*\n"
+        f"To: `{to_address}`\n"
+        f"Network: *Polygon*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⚠️ *This cannot be undone. Double-check the address!*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Confirm Withdraw", callback_data="action:confirm_withdraw"),
+                InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")
+            ]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_withdraw_amount)
+async def handle_withdraw_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bal = data["bal"]
+    try:
+        amount = float(message.text.strip())
+        if amount < 0.01 or amount > bal:
+            raise ValueError
+    except:
+        await message.answer(f"Enter a valid amount between $0.01 and ${bal:.2f}")
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(TradeStates.waiting_for_withdraw_confirm)
+    to_address = data["to_address"]
+    await message.answer(
+        f"📤 *Confirm Withdrawal*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Amount: *${amount:.2f} USDC.e*\n"
+        f"To: `{to_address}`\n"
+        f"Network: *Polygon*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⚠️ *This cannot be undone. Double-check the address!*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Confirm Withdraw", callback_data="action:confirm_withdraw"),
+                InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")
+            ]
+        ])
+    )
+
+@router.callback_query(F.data == "action:confirm_withdraw")
+async def handle_confirm_withdraw(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    to_address = data.get("to_address")
+    amount = data.get("amount")
+    if not to_address or not amount:
+        await callback.answer("Session expired.", show_alert=True)
+        await state.clear()
+        return
+    await state.clear()
+    user = get_user(callback.from_user.id)
+    private_key = decrypt_key(user["encrypted_key"])
+    bal = get_usdc_balance(user["wallet_address"])
+    if amount > bal:
+        await callback.message.edit_text(
+            f"❌ *Insufficient balance.*\n\nYou have ${bal:.2f} but tried to withdraw ${amount:.2f}.",
+            parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+        await callback.answer()
+        return
+    await callback.message.edit_text("⏳ *Processing withdrawal...*", parse_mode="Markdown")
+    try:
+        tx_hash = send_usdc(private_key, to_address, amount)
+        await callback.message.edit_text(
+            f"✅ *Withdrawal Sent!*\n\n"
+            f"Amount: *${amount:.2f} USDC.e*\n"
+            f"To: `{to_address[:8]}...{to_address[-6:]}`\n\n"
+            f"🔗 [View on PolygonScan](https://polygonscan.com/tx/{tx_hash})",
+            parse_mode="Markdown",
+            reply_markup=back_to_menu()
+        )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ *Withdrawal Failed*\n\n`{str(e)}`\n\n_Make sure you have POL for gas._",
+            parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+    await callback.answer()
+
+# ─── Settings ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:settings")
+async def cb_settings(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    display = user.get("display_name") or callback.from_user.first_name or "Not set"
+    opt_in = user.get("leaderboard_opt_in", False)
+    lb_str = "✅ Visible" if opt_in else "❌ Hidden"
+    pol_bal = get_pol_balance(user["wallet_address"])
+    gas_str = f"⛽ Gas: *{pol_bal:.4f} POL*"
+    await callback.message.edit_text(
+        f"⚙️ *Settings*\n\n"
+        f"📍 Wallet: `{user['wallet_address']}`\n"
+        f"👤 Display name: *{display}*\n"
+        f"🏆 Leaderboard: *{lb_str}*\n"
+        f"{gas_str}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Activate Wallet", callback_data="action:setup")],
+            [InlineKeyboardButton(text="👤 Set Display Name", callback_data="action:setname")],
+            [InlineKeyboardButton(text="🏆 Toggle Leaderboard", callback_data="action:togglelb")],
+            [InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "action:togglelb")
+async def cb_toggle_lb(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    current = user.get("leaderboard_opt_in", False)
+    supabase.table("users").update({"leaderboard_opt_in": not current}).eq("id", user["id"]).execute()
+    status = "visible on" if not current else "hidden from"
+    await callback.answer(f"You are now {status} the leaderboard!", show_alert=True)
+    await cb_settings(callback)
+
+@router.callback_query(F.data == "action:setname")
+async def cb_setname(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TradeStates.waiting_for_display_name)
+    await callback.message.edit_text(
+        "👤 *Set Display Name*\n\nThis name appears on the leaderboard.\n\nType your name:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:settings")]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_display_name)
+async def handle_display_name(message: Message, state: FSMContext):
+    await state.clear()
+    name = message.text.strip()[:30]
+    supabase.table("users").update({"display_name": name}).eq("id", message.from_user.id).execute()
+    await message.answer(f"✅ Display name set to *{name}*!", parse_mode="Markdown", reply_markup=back_to_menu())
+
+@router.callback_query(F.data == "action:setup")
+async def cb_setup(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "⚙️ *Activating your wallet...*\n\n_This may take up to 60 seconds._",
+        parse_mode="Markdown"
+    )
+    private_key = decrypt_key(user["encrypted_key"])
+    await maybe_relay_gas(user)
+    try:
+        count = setup_wallet_approvals(private_key)
+        if count > 0:
+            await callback.message.edit_text(
+                f"✅ *Wallet Activated!*\n\n_{count} approval(s) confirmed._\n\nYou're ready to trade!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📈 Browse Markets", callback_data="menu:markets")],
+                    [InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")]
+                ])
+            )
+        else:
+            await callback.message.edit_text(
+                "✅ *Wallet Already Active!*", parse_mode="Markdown", reply_markup=back_to_menu()
+            )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ *Setup Failed*\n\n`{str(e)}`\n\n_Gas is being topped up — try again in 30 seconds._",
+            parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+    await callback.answer()
+
+# ─── Markets ─────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:markets")
+async def cb_markets(callback: CallbackQuery):
+    await callback.message.edit_text("📈 *Fetching markets...*", parse_mode="Markdown")
+    motd = get_market_of_day()
+    if motd:
+        condition_id = motd.get("conditionId")
+        tokens = get_clob_tokens(condition_id) if condition_id else []
+        card, _, _ = format_market_card(motd, tokens)
+        await callback.message.edit_text(
+            f"🌟 *Market of the Day*\n\n{card}",
+            parse_mode="Markdown", reply_markup=get_trade_keyboard(tokens)
+        )
+    markets = get_markets(limit=5)
+    if not markets:
+        await callback.message.answer("😕 No markets found.", reply_markup=back_to_menu())
+        await callback.answer()
+        return
+    await callback.message.answer("📈 *Trending Markets* — _Tap Yes or No to trade_", parse_mode="Markdown")
+    for m in markets:
+        condition_id = m.get("conditionId")
+        tokens = get_clob_tokens(condition_id) if condition_id else []
+        card, _, _ = format_market_card(m, tokens)
+        await callback.message.answer(card, parse_mode="Markdown", reply_markup=get_trade_keyboard(tokens))
+    await callback.message.answer("_Top 5 by 24h volume_", reply_markup=back_to_menu())
+    await callback.answer()
+
+@router.callback_query(F.data == "menu:search")
+async def cb_search_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TradeStates.waiting_for_search)
+    await callback.message.edit_text(
+        "🔍 *Search Markets*\n\nType a keyword:\n\n_Examples: bitcoin, trump, fed, oscar_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_search)
+async def handle_search(message: Message, state: FSMContext):
+    await state.clear()
+    query = message.text.strip()
+    await message.answer(f"🔍 Searching *{query}*...", parse_mode="Markdown")
+    results = get_markets(search=query, limit=5)
+    if not results:
+        await message.answer(f"😕 No results for *{query}*.", parse_mode="Markdown", reply_markup=back_to_menu())
+        return
+    for m in results:
+        condition_id = m.get("conditionId")
+        tokens = get_clob_tokens(condition_id) if condition_id else []
+        card, _, _ = format_market_card(m, tokens)
+        await message.answer(card, parse_mode="Markdown", reply_markup=get_trade_keyboard(tokens))
+    await message.answer("_Tap Yes or No to trade_", reply_markup=back_to_menu())
+
+# ─── Portfolio ───────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:portfolio")
+async def cb_portfolio(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    await callback.message.edit_text("💼 *Fetching positions...*", parse_mode="Markdown")
+    pos = get_positions(user["wallet_address"])
+    if not pos:
+        await callback.message.edit_text(
+            "💼 *Portfolio*\n\nNo open positions yet.\n\n_Start trading to see positions here._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📈 Browse Markets", callback_data="menu:markets")],
+                [InlineKeyboardButton(text="📋 Activity", callback_data="menu:activity")],
+                [InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    total_value = sum(float(p.get("currentValue", 0)) for p in pos)
+    total_cost = sum(float(p.get("initialValue", 0)) for p in pos)
+    total_pnl = total_value - total_cost
+    pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+    pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+    await callback.message.edit_text(
+        f"💼 *Portfolio Summary*\n\n"
+        f"Total Value: *${total_value:.2f}*\n"
+        f"{pnl_emoji} Total PnL: *{pnl_str}*\n"
+        f"Positions: *{len(pos)}*",
+        parse_mode="Markdown"
+    )
+
+    for p in pos:
+        title = p.get("title", "Unknown")
+        outcome = p.get("outcome", "")
+        size = float(p.get("size", 0))
+        current_value = float(p.get("currentValue", 0))
+        avg_price = float(p.get("avgPrice", 0))
+        cur_price = float(p.get("curPrice", 0))
+        pnl = current_value - (size * avg_price)
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        pnl_emoji = "📈" if pnl >= 0 else "📉"
+        outcome_emoji = "🟢" if outcome == "Yes" else "🔴"
+        bar = sentiment_bar(cur_price)
+
+        sell_key = str(uuid.uuid4())[:8]
+        position_store[sell_key] = {
+            "token_id": p.get("asset"), "size": size,
+            "title": title, "outcome": outcome, "cur_price": cur_price
+        }
+
+        expiry_str = ""
+        end_date = p.get("endDate", "")
+        if end_date:
+            try:
+                end = datetime.strptime(end_date[:10], "%Y-%m-%d")
+                days_left = (end - datetime.now()).days
+                if days_left <= 1: expiry_str = "\n⚠️ *Expires tomorrow!*"
+                elif days_left <= 3: expiry_str = f"\n⚠️ _Expires in {days_left} days_"
+            except: pass
+
+        text = (
+            f"*{title}*\n\n"
+            f"{bar}\n"
+            f"{outcome_emoji} *{outcome}* — Avg: *{avg_price:.2f}¢* → Now: *{cur_price:.2f}¢*\n"
+            f"📦 *{size:.2f} shares* = *${current_value:.2f}*  {pnl_emoji} *{pnl_str}*{expiry_str}"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💸 Sell", callback_data=f"sell:{sell_key}"),
+                InlineKeyboardButton(text="🎯 Auto-Sell", callback_data=f"autosell:{sell_key}"),
+            ]
+        ])
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    await callback.message.answer(
+        "_Tap Sell or Auto-Sell on any position_",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Activity", callback_data="menu:activity")],
+            [InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")]
+        ])
+    )
+    await callback.answer()
+
+# ─── Activity ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:activity")
+async def cb_activity(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    await callback.message.answer("📋 *Fetching activity...*", parse_mode="Markdown")
+    trades = get_recent_trades(user["wallet_address"], limit=15)
+    if not trades:
+        await callback.message.answer(
+            "📋 *Activity*\n\nNo recent trades found.",
+            parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+        await callback.answer()
+        return
+    text = "📋 *Recent Activity*\n\n"
+    for t in trades:
+        trade_type = t.get("type", "")
+        title = t.get("title", "Unknown")[:35]
+        outcome = t.get("outcome", "")
+        size = float(t.get("shares", 0) or 0)
+        usdc = float(t.get("usdcSize", 0) or 0)
+        price = float(t.get("price", 0) or 0)
+        timestamp = t.get("timestamp", "")
+        date_str = ""
+        if timestamp:
+            try:
+                dt = datetime.fromtimestamp(int(timestamp))
+                date_str = dt.strftime("%b %d %H:%M")
+            except: pass
+        type_emoji = "🟢" if trade_type == "BUY" else "🔴"
+        outcome_emoji = "✅" if outcome == "Yes" else "❌"
+        text += f"{type_emoji} *{trade_type}* {outcome_emoji} *{outcome}*\n"
+        text += f"_{title}_\n"
+        text += f"{size:.2f} shares @ {round(price * 100)}¢ = *${usdc:.2f}*"
+        if date_str:
+            text += f"\n_{date_str}_"
+        text += "\n\n"
+    await callback.message.answer(text, parse_mode="Markdown", reply_markup=back_to_menu())
+    await callback.answer()
+
+# ─── Leaderboard ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:leaderboard")
+async def cb_leaderboard(callback: CallbackQuery):
+    result = supabase.table("users").select("*").eq("leaderboard_opt_in", True).execute()
+    users = result.data or []
+    if not users:
+        await callback.message.edit_text(
+            "🏆 *Leaderboard*\n\nNo traders yet!\n\n_Enable in ⚙️ Settings to appear here._",
+            parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+        await callback.answer()
+        return
+    users.sort(key=lambda u: (u.get("win_streak", 0) or 0, u.get("total_wins", 0) or 0), reverse=True)
+    text = "🏆 *PolyRift Leaderboard*\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, u in enumerate(users[:10]):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        name = u.get("display_name") or u.get("username") or "Anonymous"
+        streak = u.get("win_streak", 0) or 0
+        wins = u.get("total_wins", 0) or 0
+        trades = u.get("total_trades", 0) or 0
+        streak_str = f" 🔥{streak}" if streak >= 2 else ""
+        text += f"{medal} *{name}*{streak_str} — {wins}/{trades} wins\n"
+    text += "\n_Enable leaderboard in ⚙️ Settings to appear here._"
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=back_to_menu())
+    await callback.answer()
+
+# ─── Auto-sell ───────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("autosell:"))
+async def cb_autosell(callback: CallbackQuery, state: FSMContext):
+    sell_key = callback.data.split(":")[1]
+    position = position_store.get(sell_key)
+    if not position:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+    await state.update_data(**position)
+    await state.set_state(TradeStates.waiting_for_autosell_price)
+    cur = position.get("cur_price", 0.5)
+    outcome_emoji = "🟢" if position["outcome"] == "Yes" else "🔴"
+    await callback.message.answer(
+        f"🎯 *Set Auto-Sell Target*\n\n"
+        f"_{position['title']}_\n"
+        f"{outcome_emoji} *{position['outcome']}* — Current: *{round(cur * 100)}¢*\n\n"
+        f"Enter target price in cents (1–99):\n"
+        f"_e.g. `75` = sell when price hits 75¢_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:portfolio")]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_autosell_price)
+async def handle_autosell_price(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        target = float(message.text.strip())
+        if target < 1 or target > 99: raise ValueError
+    except:
+        await message.answer("Please enter a price between 1 and 99.")
+        return
+    await state.clear()
+    supabase.table("auto_sells").insert({
+        "user_id": message.from_user.id,
+        "token_id": data["token_id"],
+        "title": data["title"],
+        "outcome": data["outcome"],
+        "target_price": target / 100,
+        "size": data["size"],
+        "active": True
+    }).execute()
+    await message.answer(
+        f"✅ *Auto-Sell Set!*\n\n"
+        f"Will sell *{data['size']:.2f} shares* when price hits *{target:.0f}¢*",
+        parse_mode="Markdown", reply_markup=back_to_menu()
+    )
+
+# ─── Trade flow ──────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("t:"))
+async def handle_trade_click(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    outcome = parts[1]
+    token_key = parts[2]
+    token_id = token_store.get(token_key)
+    if not token_id:
+        await callback.answer("⏰ Session expired. Refresh markets.", show_alert=True)
+        return
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found. Send /start first.", show_alert=True)
+        return
+    bal = get_usdc_balance(user["wallet_address"])
+    if bal < 0.5:
+        await callback.answer(f"Insufficient balance (${bal:.2f}). Deposit USDC.e first.", show_alert=True)
+        return
+    asyncio.create_task(maybe_relay_gas(user))
+    outcome_label = "🟢 YES" if outcome == "y" else "🔴 NO"
+    await state.update_data(outcome=outcome, token_id=token_id)
+    await state.set_state(TradeStates.waiting_for_amount)
+    await callback.message.answer(
+        f"*Place Trade — {outcome_label}*\n\n"
+        f"💰 Available: *${bal:.2f} USDC.e*\n\n"
+        f"Select amount or type custom:\n"
+        f"_Min: $1  •  1% fee applies_",
+        parse_mode="Markdown",
+        reply_markup=dynamic_amount_buttons(bal, outcome, token_key)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("amt:"))
+async def handle_quick_amount(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    amount = float(parts[1])
+    outcome = parts[2]
+    token_key = parts[3]
+    token_id = token_store.get(token_key)
+    if not token_id:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+    await state.update_data(outcome=outcome, token_id=token_id, amount=amount)
+    await state.set_state(TradeStates.waiting_for_confirm)
+    outcome_label = "🟢 YES" if outcome == "y" else "🔴 NO"
+    fee = round(amount * FEE_PERCENT, 4)
+    await callback.message.edit_text(
+        f"*Confirm Trade*\n\n"
+        f"Direction: *{outcome_label}*\n"
+        f"Amount: *${amount:.2f} USDC.e*\n"
+        f"Fee (1%): *${fee:.4f}*\n"
+        f"Net trade: *${amount - fee:.4f}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Confirm", callback_data="action:confirm_trade"),
+                InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")
+            ]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_amount)
+async def handle_amount_text(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+        if amount < 1: raise ValueError
+    except:
+        await message.answer("Please enter a valid amount of at least $1")
+        return
+    data = await state.get_data()
+    outcome = data["outcome"]
+    await state.update_data(amount=amount)
+    await state.set_state(TradeStates.waiting_for_confirm)
+    outcome_label = "🟢 YES" if outcome == "y" else "🔴 NO"
+    fee = round(amount * FEE_PERCENT, 4)
+    await message.answer(
+        f"*Confirm Trade*\n\n"
+        f"Direction: *{outcome_label}*\n"
+        f"Amount: *${amount:.2f} USDC.e*\n"
+        f"Fee (1%): *${fee:.4f}*\n"
+        f"Net trade: *${amount - fee:.4f}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Confirm", callback_data="action:confirm_trade"),
+                InlineKeyboardButton(text="✕ Cancel", callback_data="menu:main")
+            ]
+        ])
+    )
+
+@router.callback_query(F.data == "action:confirm_trade")
+async def handle_confirm_trade(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    token_id = data.get("token_id")
+    outcome = data.get("outcome")
+    amount = data.get("amount")
+    if not all([token_id, outcome, amount]):
+        await callback.answer("Session expired.", show_alert=True)
+        await state.clear()
+        return
+    await state.clear()
+    user = get_user(callback.from_user.id)
+    private_key = decrypt_key(user["encrypted_key"])
+    await callback.message.edit_text("⏳ *Placing order...*", parse_mode="Markdown")
+    try:
+        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=POLYGON)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        order_args = MarketOrderArgs(token_id=token_id, amount=amount, side="BUY")
+        signed_order = client.create_market_order(order_args)
+        resp = client.post_order(signed_order, OrderType.FOK)
+        if resp.get("success"):
+            fee = collect_fee(private_key, amount)
+            outcome_label = "🟢 YES" if outcome == "y" else "🔴 NO"
+            streak = user.get("win_streak", 0) or 0
+            streak_str = f"\n🔥 *Win streak: {streak + 1}!*" if streak >= 1 else ""
+            yk = str(uuid.uuid4())[:8]
+            token_store[yk] = token_id
+            await callback.message.edit_text(
+                f"✅ *Trade Successful!*\n\n"
+                f"Direction: *{outcome_label}*\n"
+                f"Amount: *${amount:.2f} USDC.e*\n"
+                f"Fee: *${fee:.4f}*{streak_str}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔥 Double Down", callback_data=f"t:{outcome}:{yk}")],
+                    [InlineKeyboardButton(text="💼 View Portfolio", callback_data="menu:portfolio")],
+                    [InlineKeyboardButton(text="📈 More Markets", callback_data="menu:markets")]
+                ])
+            )
+        else:
+            await callback.message.edit_text(
+                f"⚠️ *Order Failed*\n\n`{resp.get('errorMsg', 'Unknown error')}`",
+                parse_mode="Markdown", reply_markup=back_to_menu()
+            )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ *Error*\n\n`{str(e)}`", parse_mode="Markdown", reply_markup=back_to_menu()
+        )
+    await callback.answer()
+
+# ─── Sell flow ───────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("sell:"))
+async def handle_sell_click(callback: CallbackQuery, state: FSMContext):
+    sell_key = callback.data.split(":")[1]
+    position = position_store.get(sell_key)
+    if not position:
+        await callback.answer("Session expired. Open Portfolio again.", show_alert=True)
+        return
+    outcome_emoji = "🟢" if position["outcome"] == "Yes" else "🔴"
+    await state.update_data(**position)
+    await state.set_state(TradeStates.waiting_for_sell_amount)
+    await callback.message.answer(
+        f"💸 *Sell Position*\n\n"
+        f"_{position['title']}_\n"
+        f"{outcome_emoji} *{position['outcome']}* — *{position['size']:.2f} shares*\n\n"
+        f"How many shares to sell?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💸 Sell All", callback_data=f"sellall:{sell_key}")],
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:portfolio")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("sellall:"))
+async def handle_sell_all(callback: CallbackQuery, state: FSMContext):
+    sell_key = callback.data.split(":")[1]
+    position = position_store.get(sell_key)
+    if not position:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+    await state.clear()
+    await _execute_sell(callback.message, position["token_id"], position["size"], callback.from_user.id)
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_sell_amount)
+async def handle_sell_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    max_size = data.get("size", 0)
+    try:
+        size = float(message.text.strip())
+        if size <= 0 or size > max_size: raise ValueError
+    except:
+        await message.answer(f"Enter a valid amount between 0 and {max_size:.2f}")
+        return
+    await state.clear()
+    await _execute_sell(message, data["token_id"], size, message.from_user.id)
+
+async def _execute_sell(message, token_id, size, user_id):
+    user = get_user(user_id)
+    private_key = decrypt_key(user["encrypted_key"])
+    await message.answer(f"⏳ *Selling {size:.2f} shares...*", parse_mode="Markdown")
+    try:
+        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=POLYGON)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        order_args = MarketOrderArgs(token_id=token_id, amount=size, side="SELL")
+        signed_order = client.create_market_order(order_args)
+        resp = client.post_order(signed_order, OrderType.FOK)
+        if resp.get("success"):
+            await message.answer(
+                f"✅ *Sold {size:.2f} shares!*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💼 Portfolio", callback_data="menu:portfolio")],
+                    [InlineKeyboardButton(text="🏠 Menu", callback_data="menu:main")]
+                ])
+            )
+        else:
+            await message.answer(
+                f"⚠️ *Sell Failed*\n\n`{resp.get('errorMsg', 'Unknown error')}`",
+                parse_mode="Markdown", reply_markup=back_to_menu()
+            )
+    except Exception as e:
+        await message.answer(f"❌ *Error*\n\n`{str(e)}`", parse_mode="Markdown", reply_markup=back_to_menu())
+
+# ─── Copy Trade Menu ─────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:copy")
+async def cb_copy_menu(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("No wallet found.", show_alert=True)
+        return
+    active = supabase.table("copy_trades").select("*").eq("user_id", user["id"]).eq("active", True).execute()
+    text = "🤖 *Copy Trading*\n\n"
+    buttons = []
+    if active.data:
+        text += f"*Following {len(active.data)} trader(s):*\n\n"
+        for c in active.data:
+            w = c["target_wallet"]
+            mode = c.get("copy_mode") or "percent"
+            paused = c.get("paused", False)
+            status = "⏸" if paused else "▶️"
+            if mode == "fixed":
+                mode_str = f"Fixed ${c.get('fixed_amount') or 10}"
+            else:
+                pct = int((c.get("copy_percent") or 0.10) * 100)
+                max_t = c.get("max_per_trade") or 50
+                mode_str = f"{pct}% max ${max_t}"
+            text += f"{status} `{w[:8]}...{w[-6:]}` — {mode_str}\n"
+            buttons.append([InlineKeyboardButton(text=f"⚙️ Manage {w[:8]}...", callback_data=f"copy:manage:{c['id']}")])
+    else:
+        text += "_Not copying anyone yet._\n\nMirror trades from top Polymarket wallets automatically.\n"
+    buttons.append([InlineKeyboardButton(text="➕ Follow a Trader", callback_data="action:copy_prompt")])
+    buttons.append([InlineKeyboardButton(text="← Back to Menu", callback_data="menu:main")])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("copy:manage:"))
+async def cb_copy_manage(callback: CallbackQuery):
+    copy_id = int(callback.data.split(":")[2])
+    result = supabase.table("copy_trades").select("*").eq("id", copy_id).execute()
+    if not result.data:
+        await callback.answer("Not found.", show_alert=True)
+        return
+    c = result.data[0]
+    w = c["target_wallet"]
+    mode = c.get("copy_mode") or "percent"
+    paused = c.get("paused", False)
+    status = "⏸ Paused" if paused else "▶️ Active"
+    pause_btn = "▶️ Resume" if paused else "⏸ Pause"
+    pause_action = f"copy:resume:{copy_id}" if paused else f"copy:pause:{copy_id}"
+    if mode == "fixed":
+        mode_str = f"Fixed *${c.get('fixed_amount') or 10}* per trade"
+    else:
+        pct = int((c.get("copy_percent") or 0.10) * 100)
+        max_t = c.get("max_per_trade") or 50
+        mode_str = f"*{pct}% of balance* (max ${max_t})"
+    await callback.message.edit_text(
+        f"⚙️ *Manage Copy Trade*\n\n"
+        f"Wallet: `{w}`\n"
+        f"Status: *{status}*\n"
+        f"Copy mode: {mode_str}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=pause_btn, callback_data=pause_action)],
+            [
+                InlineKeyboardButton(text="📊 % of Balance", callback_data=f"copy:setpct:{copy_id}"),
+                InlineKeyboardButton(text="💵 Fixed Amount", callback_data=f"copy:setfixed:{copy_id}"),
+            ],
+            [InlineKeyboardButton(text="📈 Set Max $", callback_data=f"copy:setmax:{copy_id}")],
+            [InlineKeyboardButton(text="🗑 Stop & Remove", callback_data=f"copy:stop:{copy_id}")],
+            [InlineKeyboardButton(text="← Back", callback_data="menu:copy")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("copy:pause:"))
+async def cb_copy_pause(callback: CallbackQuery):
+    copy_id = int(callback.data.split(":")[2])
+    supabase.table("copy_trades").update({"paused": True}).eq("id", copy_id).execute()
+    await callback.answer("⏸ Paused.", show_alert=True)
+    await cb_copy_manage(callback)
+
+@router.callback_query(F.data.startswith("copy:resume:"))
+async def cb_copy_resume(callback: CallbackQuery):
+    copy_id = int(callback.data.split(":")[2])
+    supabase.table("copy_trades").update({"paused": False}).eq("id", copy_id).execute()
+    await callback.answer("▶️ Resumed.", show_alert=True)
+    await cb_copy_manage(callback)
+
+@router.callback_query(F.data.startswith("copy:stop:"))
+async def cb_copy_stop(callback: CallbackQuery):
+    copy_id = int(callback.data.split(":")[2])
+    supabase.table("copy_trades").update({"active": False}).eq("id", copy_id).execute()
+    await callback.message.edit_text("🗑 *Copy trade removed.*", parse_mode="Markdown", reply_markup=back_to_copy())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("copy:setpct:"))
+async def cb_copy_setpct(callback: CallbackQuery, state: FSMContext):
+    copy_id = int(callback.data.split(":")[2])
+    await state.update_data(copy_id=copy_id)
+    await state.set_state(TradeStates.waiting_for_copy_percent)
+    await callback.message.edit_text(
+        "📊 *% of Balance Mode*\n\nCopy a percentage of your balance per trade.\n\n_e.g. 10% of $100 = $10 per copy trade_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="5%", callback_data=f"copy:pct:5:{copy_id}"),
+                InlineKeyboardButton(text="10%", callback_data=f"copy:pct:10:{copy_id}"),
+                InlineKeyboardButton(text="25%", callback_data=f"copy:pct:25:{copy_id}"),
+                InlineKeyboardButton(text="50%", callback_data=f"copy:pct:50:{copy_id}"),
+            ],
+            [InlineKeyboardButton(text="✕ Cancel", callback_data=f"copy:manage:{copy_id}")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("copy:pct:"))
+async def cb_copy_pct_quick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    pct = int(parts[2])
+    copy_id = int(parts[3])
+    await state.clear()
+    supabase.table("copy_trades").update({"copy_mode": "percent", "copy_percent": pct / 100}).eq("id", copy_id).execute()
+    await callback.answer(f"✅ Set to {pct}% of balance", show_alert=True)
+    await cb_copy_manage(callback)
+
+@router.message(TradeStates.waiting_for_copy_percent)
+async def handle_copy_percent(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        pct = float(message.text.strip())
+        if pct < 1 or pct > 100: raise ValueError
+    except:
+        await message.answer("Enter a number between 1 and 100.")
+        return
+    await state.clear()
+    supabase.table("copy_trades").update({"copy_mode": "percent", "copy_percent": pct / 100}).eq("id", data["copy_id"]).execute()
+    await message.answer(f"✅ Set to *{pct:.0f}%* of balance per trade.", parse_mode="Markdown", reply_markup=back_to_copy())
+
+@router.callback_query(F.data.startswith("copy:setfixed:"))
+async def cb_copy_setfixed(callback: CallbackQuery, state: FSMContext):
+    copy_id = int(callback.data.split(":")[2])
+    await state.update_data(copy_id=copy_id)
+    await state.set_state(TradeStates.waiting_for_copy_fixed)
+    await callback.message.edit_text(
+        "💵 *Fixed Amount Mode*\n\nUse the same dollar amount on every copied trade.\n\n_e.g. $10 = always copy with exactly $10_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="$5", callback_data=f"copy:fixed:5:{copy_id}"),
+                InlineKeyboardButton(text="$10", callback_data=f"copy:fixed:10:{copy_id}"),
+                InlineKeyboardButton(text="$25", callback_data=f"copy:fixed:25:{copy_id}"),
+                InlineKeyboardButton(text="$50", callback_data=f"copy:fixed:50:{copy_id}"),
+            ],
+            [InlineKeyboardButton(text="✕ Cancel", callback_data=f"copy:manage:{copy_id}")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("copy:fixed:"))
+async def cb_copy_fixed_quick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    amount = int(parts[2])
+    copy_id = int(parts[3])
+    await state.clear()
+    supabase.table("copy_trades").update({"copy_mode": "fixed", "fixed_amount": amount}).eq("id", copy_id).execute()
+    await callback.answer(f"✅ Fixed at ${amount} per trade", show_alert=True)
+    await cb_copy_manage(callback)
+
+@router.message(TradeStates.waiting_for_copy_fixed)
+async def handle_copy_fixed(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        amount = float(message.text.strip())
+        if amount < 1: raise ValueError
+    except:
+        await message.answer("Enter a valid dollar amount (e.g. `10`)", parse_mode="Markdown")
+        return
+    await state.clear()
+    supabase.table("copy_trades").update({"copy_mode": "fixed", "fixed_amount": amount}).eq("id", data["copy_id"]).execute()
+    await message.answer(f"✅ Fixed at *${amount:.2f}* per trade.", parse_mode="Markdown", reply_markup=back_to_copy())
+
+@router.callback_query(F.data.startswith("copy:setmax:"))
+async def cb_copy_setmax(callback: CallbackQuery, state: FSMContext):
+    copy_id = int(callback.data.split(":")[2])
+    await state.update_data(copy_id=copy_id)
+    await state.set_state(TradeStates.waiting_for_copy_max)
+    await callback.message.edit_text(
+        "📈 *Set Max Per Trade*\n\nCap the maximum USD per copy trade (applies to % mode).",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="$10", callback_data=f"copy:max:10:{copy_id}"),
+                InlineKeyboardButton(text="$25", callback_data=f"copy:max:25:{copy_id}"),
+                InlineKeyboardButton(text="$50", callback_data=f"copy:max:50:{copy_id}"),
+                InlineKeyboardButton(text="$100", callback_data=f"copy:max:100:{copy_id}"),
+            ],
+            [InlineKeyboardButton(text="✕ Cancel", callback_data=f"copy:manage:{copy_id}")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("copy:max:"))
+async def cb_copy_max_quick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    max_t = int(parts[2])
+    copy_id = int(parts[3])
+    await state.clear()
+    supabase.table("copy_trades").update({"max_per_trade": max_t}).eq("id", copy_id).execute()
+    await callback.answer(f"✅ Max set to ${max_t}", show_alert=True)
+    await cb_copy_manage(callback)
+
+@router.message(TradeStates.waiting_for_copy_max)
+async def handle_copy_max(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        max_t = float(message.text.strip())
+        if max_t < 1: raise ValueError
+    except:
+        await message.answer("Enter a valid dollar amount.")
+        return
+    await state.clear()
+    supabase.table("copy_trades").update({"max_per_trade": max_t}).eq("id", data["copy_id"]).execute()
+    await message.answer(f"✅ Max set to *${max_t:.0f}*", parse_mode="Markdown", reply_markup=back_to_copy())
+
+@router.callback_query(F.data == "action:copy_prompt")
+async def cb_copy_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TradeStates.waiting_for_copy_wallet)
+    await callback.message.edit_text(
+        "🤖 *Follow a Trader*\n\nPaste their Polymarket wallet address:\n\n_Find top traders at polymarket.com/leaderboard_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✕ Cancel", callback_data="menu:copy")]
+        ])
+    )
+    await callback.answer()
+
+@router.message(TradeStates.waiting_for_copy_wallet)
+async def handle_copy_wallet(message: Message, state: FSMContext):
+    await state.clear()
+    target = message.text.strip()
+    user = get_user(message.from_user.id)
+    if not target.startswith("0x") or len(target) != 42:
+        await message.answer("❌ Invalid wallet address.", reply_markup=back_to_copy())
+        return
+    existing = supabase.table("copy_trades").select("*").eq("user_id", user["id"]).eq("target_wallet", target.lower()).eq("active", True).execute()
+    if existing.data:
+        await message.answer("⚠️ Already copying this wallet!", reply_markup=back_to_copy())
+        return
+    supabase.table("copy_trades").insert({
+        "user_id": user["id"], "target_wallet": target.lower(),
+        "active": True, "copy_percent": 0.10, "max_per_trade": 50,
+        "copy_mode": "percent"
+    }).execute()
+    await message.answer(
+        f"✅ *Now Copying!*\n\n`{target[:8]}...{target[-6:]}`\n\n"
+        f"Default: *10% of balance* per trade (max $50)\n\n"
+        f"_Tap Manage to switch to Fixed Amount mode._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Manage Settings", callback_data="menu:copy")],
+            [InlineKeyboardButton(text="← Menu", callback_data="menu:main")]
+        ])
+    )
+
+# ─── Background jobs ──────────────────────────────────────────
+
+async def check_auto_sells():
+    try:
+        active = supabase.table("auto_sells").select("*").eq("active", True).execute()
+        for a in (active.data or []):
+            try:
+                r = requests.get(f"https://clob.polymarket.com/orderbook/{a['token_id']}", timeout=5)
+                if not r.ok: continue
+                mid = float(r.json().get("mid_price", 0) or 0)
+                if mid <= 0 or mid < a["target_price"]: continue
+                user = get_user(a["user_id"])
+                if not user: continue
+                private_key = decrypt_key(user["encrypted_key"])
+                client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=POLYGON)
+                creds = client.create_or_derive_api_creds()
+                client.set_api_creds(creds)
+                order_args = MarketOrderArgs(token_id=a["token_id"], amount=a["size"], side="SELL")
+                signed_order = client.create_market_order(order_args)
+                resp = client.post_order(signed_order, OrderType.FOK)
+                if resp.get("success"):
+                    supabase.table("auto_sells").update({"active": False}).eq("id", a["id"]).execute()
+                    await bot.send_message(
+                        user["id"],
+                        f"🎯 *Auto-Sell Triggered!*\n\n"
+                        f"_{a['title']}_\n"
+                        f"Sold *{a['size']:.2f} shares* at *{round(mid * 100)}¢*\n"
+                        f"Target was *{round(a['target_price'] * 100)}¢*",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💼 Portfolio", callback_data="menu:portfolio")]
+                        ])
+                    )
+            except Exception as e:
+                print(f"Auto-sell error: {e}")
+    except Exception as e:
+        print(f"Auto-sell loop error: {e}")
+
+async def check_price_alerts():
+    try:
+        all_users = supabase.table("users").select("id, wallet_address").execute()
+        for user in (all_users.data or []):
+            pos = get_positions(user["wallet_address"])
+            for p in pos:
+                token_id = p.get("asset")
+                if not token_id: continue
+                cur_price = float(p.get("curPrice", 0))
+                prev = last_prices.get(token_id)
+                if prev and prev > 0:
+                    change = abs(cur_price - prev) / prev
+                    if change >= 0.10:
+                        direction = "📈 UP" if cur_price > prev else "📉 DOWN"
+                        try:
+                            await bot.send_message(
+                                user["id"],
+                                f"🔔 *Price Alert!*\n\n"
+                                f"_{p.get('title', 'Unknown')}_\n"
+                                f"Your *{p.get('outcome', '')}* moved {direction} {round(change * 100)}%\n"
+                                f"Now: *{round(cur_price * 100)}¢* (was {round(prev * 100)}¢)",
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="💼 Portfolio", callback_data="menu:portfolio")]
+                                ])
+                            )
+                        except: pass
+                last_prices[token_id] = cur_price
+    except Exception as e:
+        print(f"Price alert error: {e}")
+
+async def gas_relay_loop():
+    """Background job: proactively top up any user running low on POL."""
+    try:
+        if not RELAY_PRIVATE_KEY:
+            return
+        all_users = supabase.table("users").select("*").execute()
+        for user in (all_users.data or []):
+            try:
+                await maybe_relay_gas(user)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"Relay loop user error: {e}")
+    except Exception as e:
+        print(f"Gas relay loop error: {e}")
+
+async def execute_copy_trade(user, trade, copy_config):
+    try:
+        private_key = decrypt_key(user["encrypted_key"])
+        bal = get_usdc_balance(user["wallet_address"])
+        if bal < 1: return
+        trade_type = trade.get("type", "")
+        if trade_type not in ["BUY", "SELL"]: return
+        asset = trade.get("asset")
+        if not asset: return
+        mode = copy_config.get("copy_mode") or "percent"
+        if mode == "fixed":
+            copy_amount = float(copy_config.get("fixed_amount") or 10)
+        else:
+            pct = copy_config.get("copy_percent") or 0.10
+            max_t = copy_config.get("max_per_trade") or 50
+            copy_amount = min(bal * pct, max_t)
+        if copy_amount < 1 or copy_amount > bal: return
+        client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=POLYGON)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        order_args = MarketOrderArgs(token_id=asset, amount=copy_amount, side=trade_type)
+        signed_order = client.create_market_order(order_args)
+        resp = client.post_order(signed_order, OrderType.FOK)
+        if resp.get("success"):
+            collect_fee(private_key, copy_amount)
+            w = copy_config["target_wallet"]
+            await bot.send_message(
+                user["id"],
+                f"🤖 *Copy Trade!*\n\n"
+                f"Copying: `{w[:8]}...{w[-6:]}`\n"
+                f"_{trade.get('title', 'Unknown')}_\n"
+                f"*{trade_type}* — *${copy_amount:.2f}*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💼 Portfolio", callback_data="menu:portfolio")]
+                ])
+            )
+    except Exception as e:
+        print(f"Copy trade error: {e}")
+
+async def copy_trade_loop():
+    try:
+        active = supabase.table("copy_trades").select("*").eq("active", True).eq("paused", False).execute()
+        for copy in (active.data or []):
+            user = get_user(copy["user_id"])
+            if not user: continue
+            trades = get_recent_trades(copy["target_wallet"], limit=5)
+            for trade in trades:
+                trade_id = trade.get("id") or trade.get("transactionHash")
+                if not trade_id: continue
+                uid = f"{copy['user_id']}_{trade_id}"
+                if is_trade_seen(copy["user_id"], uid): continue
+                mark_trade_seen(copy["user_id"], uid)
+                await execute_copy_trade(user, trade, copy)
+    except Exception as e:
+        print(f"Loop error: {e}")
+
+# ─── Slash shortcuts ──────────────────────────────────────────
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message):
+    user = get_user(message.from_user.id)
+    bal = get_usdc_balance(user["wallet_address"]) if user else 0
+    pnl = get_daily_pnl(user["wallet_address"]) if user else 0
+    pnl_str = f"📈 +${pnl:.2f}" if pnl >= 0 else f"📉 -${abs(pnl):.2f}"
+    await message.answer(
+        f"💰 *${bal:.2f}* USDC.e  {pnl_str} PnL\n\nWhat would you like to do?",
+        parse_mode="Markdown", reply_markup=main_menu()
+    )
+
+@router.message(Command("markets"))
+async def cmd_markets(message: Message):
+    await message.answer("📈 *Fetching markets...*", parse_mode="Markdown")
+    markets = get_markets(limit=5)
+    for m in markets:
+        condition_id = m.get("conditionId")
+        tokens = get_clob_tokens(condition_id) if condition_id else []
+        card, _, _ = format_market_card(m, tokens)
+        await message.answer(card, parse_mode="Markdown", reply_markup=get_trade_keyboard(tokens))
+    await message.answer("_Tap Yes or No to trade_", reply_markup=back_to_menu())
+
+async def main():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Open PolyRift"),
+        BotCommand(command="menu", description="Main menu"),
+        BotCommand(command="markets", description="Trending markets"),
+    ])
+    scheduler.add_job(copy_trade_loop, 'interval', minutes=1)
+    scheduler.add_job(check_auto_sells, 'interval', minutes=2)
+    scheduler.add_job(check_price_alerts, 'interval', minutes=10)
+    scheduler.add_job(gas_relay_loop, 'interval', minutes=30)
+    scheduler.start()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
