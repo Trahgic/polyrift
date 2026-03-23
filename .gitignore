@@ -6,3 +6,4 @@ venv/
 *.log
 .pm2/
 *.swp
+*.swp
